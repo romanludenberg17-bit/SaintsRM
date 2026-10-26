@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -41,12 +42,11 @@ std::atomic<uint32_t> g_last_fault_instruction{0};
 std::atomic<uint32_t> g_fault_reentry_count{0};
 std::atomic<uint32_t> g_fault_contention_count{0};
 
-// Active protected-page test state. Only the test thread mutates this state.
 enum class FaultMode : uint32_t { kNone = 0, kDumpAndSkip = 1, kDemandCommit = 2 };
 std::atomic<uint32_t> g_fault_mode{0};
 std::atomic<uintptr_t> g_test_page{0};
 std::atomic<size_t> g_test_page_size{0};
-std::atomic<uint32_t> g_test_expected_instruction{0xF9400020u}; // ldr x0, [x1]
+std::atomic<uint32_t> g_test_expected_instruction{0xF9400020u};
 std::atomic<bool> g_test_fault_seen{false};
 std::atomic<bool> g_test_mprotect_succeeded{false};
 
@@ -64,8 +64,6 @@ void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
     if (is_ignore_handler(g_previous_sigsegv)) return;
 
     if (is_default_handler(g_previous_sigsegv)) {
-        // Restore the original default disposition. Returning from this handler
-        // makes the kernel retry the faulting instruction with SIG_DFL.
         sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
         return;
     }
@@ -97,9 +95,6 @@ void saintsrm_sigsegv_handler(int sig, siginfo_t* info, void* context) {
 
     g_last_fault_address.store(fault, std::memory_order_relaxed);
     g_last_fault_pc.store(pc, std::memory_order_relaxed);
-    // Do not dereference the faulting PC from the handler: that read can fault
-    // recursively. For this deterministic smoke test the expected instruction
-    // is known before execution and is stored in preallocated state.
     const uint32_t expected = g_test_expected_instruction.load(std::memory_order_relaxed);
     g_last_fault_instruction.store(expected, std::memory_order_relaxed);
 
@@ -108,31 +103,26 @@ void saintsrm_sigsegv_handler(int sig, siginfo_t* info, void* context) {
     const uint32_t mode = g_fault_mode.load(std::memory_order_relaxed);
     const bool is_test_page = page != 0 && page_size != 0 &&
         fault >= page && fault < page + page_size;
-    const bool is_test_instruction = mode != 0;
 
-    if (is_test_page && is_test_instruction) {
+    if (is_test_page && mode == static_cast<uint32_t>(FaultMode::kDemandCommit)) {
         g_test_fault_seen.store(true, std::memory_order_relaxed);
-
-        if (mode == static_cast<uint32_t>(FaultMode::kDemandCommit)) {
-            // Re-enable the page and return WITHOUT advancing PC. The CPU will
-            // retry the original LDR and the C++ code verifies the loaded value.
-            const long result = syscall(SYS_mprotect,
-                                        reinterpret_cast<void*>(page),
-                                        page_size,
-                                        PROT_READ | PROT_WRITE);
-            g_test_mprotect_succeeded.store(result == 0, std::memory_order_relaxed);
-            if (result == 0) {
-                g_fault_handler_busy.clear(std::memory_order_release);
-                return;
-            }
-        } else if (mode == static_cast<uint32_t>(FaultMode::kDumpAndSkip)) {
-            // Diagnostic-only mode: suppress the load result and skip exactly
-            // one 32-bit AArch64 instruction.
-            uc->uc_mcontext.regs[0] = 0;
-            uc->uc_mcontext.pc = pc + 4;
+        const long result = syscall(SYS_mprotect,
+                                    reinterpret_cast<void*>(page),
+                                    page_size,
+                                    PROT_READ | PROT_WRITE);
+        g_test_mprotect_succeeded.store(result == 0, std::memory_order_relaxed);
+        if (result == 0) {
             g_fault_handler_busy.clear(std::memory_order_release);
             return;
         }
+    }
+
+    if (is_test_page && mode == static_cast<uint32_t>(FaultMode::kDumpAndSkip)) {
+        g_test_fault_seen.store(true, std::memory_order_relaxed);
+        uc->uc_mcontext.regs[0] = 0;
+        uc->uc_mcontext.pc = pc + 4;
+        g_fault_handler_busy.clear(std::memory_order_release);
+        return;
     }
 
     g_fault_contention_count.fetch_add(1, std::memory_order_relaxed);
