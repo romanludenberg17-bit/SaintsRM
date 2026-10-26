@@ -3,11 +3,12 @@ plugins {
 }
 
 android {
-    namespace = "com.saintsrM.smoketest"
+    namespace = "com.saintsm.smoketest"
     compileSdk = 36
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
-        applicationId = "com.saintsrM.smoketest"
+        applicationId = "com.saintsm.smoketest"
         minSdk = 27
         targetSdk = 36
         versionCode = 1
