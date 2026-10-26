@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,7 +29,8 @@ jobs:
 
       - name: Install Android build dependencies
         run: |
-          sdkmanager --install \
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 10m sdkmanager --install \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "cmake;3.31.6" \
@@ -41,28 +43,37 @@ jobs:
 
       - name: Build debug APK
         working-directory: android
-        run: gradle :app:assembleDebug --stacktrace
+        run: timeout --signal=TERM --kill-after=30s 20m gradle :app:assembleDebug --stacktrace
 
       - name: Verify 16KB APK ZIP alignment
         run: |
+          set -euo pipefail
           APK=$(find android/app/build/outputs/apk/debug -name '*.apk' -print -quit)
           test -n "$APK"
-          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -v -c -P 16 4 "$APK"
+          timeout --signal=TERM --kill-after=10s 2m \
+            "$ANDROID_HOME/build-tools/36.0.0/zipalign" -v -c -P 16 4 "$APK"
 
       - name: Verify ELF LOAD alignment
         run: |
           set -euo pipefail
           APK=$(find android/app/build/outputs/apk/debug -name '*.apk' -print -quit)
+          test -n "$APK"
           TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
           unzip -q "$APK" 'lib/arm64-v8a/*.so' -d "$TMP"
-          OBJDUMP="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+          READELF="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          test -x "$READELF"
           for so in "$TMP"/lib/arm64-v8a/*.so; do
             echo "== $so =="
-            "$OBJDUMP" -p "$so" | grep 'LOAD'
-            if "$OBJDUMP" -p "$so" | grep 'LOAD' | grep -v 'align 2\\*\\*14' >/dev/null; then
-              echo "ERROR: LOAD segment is not 16KB aligned: $so"
-              exit 1
-            fi
+            LOADS=$("$READELF" -lW "$so" | awk '$1 == "LOAD" {print $NF}')
+            test -n "$LOADS"
+            echo "$LOADS"
+            while IFS= read -r align; do
+              test "$align" = "0x4000" || {
+                echo "ERROR: LOAD segment alignment is $align, expected 0x4000: $so"
+                exit 1
+              }
+            done <<< "$LOADS"
           done
 
       - name: Upload APK
@@ -70,3 +81,4 @@ jobs:
         with:
           name: saintsrm-smoke-debug
           path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
