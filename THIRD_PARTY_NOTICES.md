@@ -4,13 +4,13 @@ SaintsRM is an Android native-port project. This repository does not contain Sai
 
 ## Saints Reborn
 
-SaintsRM is based on work from Saints Reborn/ReXGlue integration work.
-
 Project: https://github.com/whompay/SaintsReborn
 
 License: MIT
 
-The applicable MIT license text and copyright notices from the upstream project must be preserved when source files are incorporated into SaintsRM.
+License text: `LICENSES/SAINTS_REBORN_MIT.txt`
+
+When Saints Reborn source is incorporated into SaintsRM, its applicable upstream copyright notices must remain with the corresponding source files.
 
 ## ReXGlue SDK
 
@@ -18,7 +18,9 @@ Project: https://github.com/rexglue/rexglue-sdk
 
 License: BSD 3-Clause
 
-The applicable BSD 3-Clause license text and copyright notices from the upstream project must be preserved when source files are incorporated into SaintsRM.
+License text: `LICENSES/REXGLUE_BSD-3-CLAUSE.txt`
+
+When ReXGlue source is incorporated into SaintsRM, its applicable upstream copyright notices must remain with the corresponding source files.
 
 ## Game data
 
