@@ -12,7 +12,10 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(saintsrm_smoke SHARED native_smoke.cpp)
+add_library(saintsrm_smoke SHARED
+    native_smoke.cpp
+    vulkan_report.cpp
+)
 
 target_compile_options(saintsrm_smoke PRIVATE
     -Wall -Wextra -Wpedantic
