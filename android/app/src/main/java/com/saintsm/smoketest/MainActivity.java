@@ -30,6 +30,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private static native void nativeSetSurface(Surface surface);
     private static native void nativeClearSurface();
     private static native String nativeRunSmokeTests();
+    private static native String nativeGetVulkanReport();
     private static native void nativeOnTrimMemory(int level);
 
     @Override
@@ -64,12 +65,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         setContentView(root);
 
         String nativeReport = nativeRunSmokeTests();
-        reportText = buildDeviceReport(nativeReport);
+        String vulkanReport = nativeGetVulkanReport();
+        reportText = buildDeviceReport(nativeReport, vulkanReport);
         status.setText(reportText);
         writeSmokeReport(reportText);
     }
 
-    private String buildDeviceReport(String nativeReport) {
+    private String buildDeviceReport(String nativeReport, String vulkanReport) {
         StringBuilder out = new StringBuilder();
         out.append("Android model: ").append(Build.MODEL).append('\n');
         out.append("Android manufacturer: ").append(Build.MANUFACTURER).append('\n');
@@ -82,6 +84,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         out.append("Android SDK_INT: ").append(Build.VERSION.SDK_INT).append('\n');
         out.append('\n');
         out.append(nativeReport);
+        out.append('\n');
+        out.append(vulkanReport);
         return out.toString();
     }
 
