@@ -2,11 +2,13 @@
 #include <android/native_window_jni.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
 #include <sys/mman.h>
-#include <sys/sysconf.h>
 #include <ucontext.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -32,15 +34,23 @@ std::atomic<bool> g_signal_installed{false};
 std::atomic<bool> g_protected_page_passed{false};
 
 bool is_default_handler(const struct sigaction& action) {
+    if ((action.sa_flags & SA_SIGINFO) != 0) return action.sa_sigaction == SIG_DFL;
     return action.sa_handler == SIG_DFL;
 }
 
 bool is_ignore_handler(const struct sigaction& action) {
+    if ((action.sa_flags & SA_SIGINFO) != 0) return action.sa_sigaction == SIG_IGN;
     return action.sa_handler == SIG_IGN;
 }
 
 void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
-    if (is_ignore_handler(g_previous_sigsegv)) {
+    if (is_ignore_handler(g_previous_sigsegv)) return;
+
+    if (is_default_handler(g_previous_sigsegv)) {
+        // Restore the original/default disposition. Returning from the handler
+        // causes the faulting instruction to be retried and the kernel will
+        // then apply the restored default action.
+        sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
         return;
     }
 
@@ -49,14 +59,11 @@ void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
         return;
     }
 
-    if (g_previous_sigsegv.sa_handler && g_previous_sigsegv.sa_handler != SIG_DFL) {
+    if (g_previous_sigsegv.sa_handler) {
         g_previous_sigsegv.sa_handler(sig);
         return;
     }
 
-    // Restore the previous/default disposition. Returning from this handler
-    // causes the faulting instruction to be retried and the kernel will then
-    // deliver SIGSEGV using the restored disposition.
     sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
 }
 
@@ -66,9 +73,8 @@ void saintsrm_sigsegv_handler(int sig, siginfo_t* info, void* context) {
     const uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->si_addr);
 
-    // The smoke test intentionally executes a single AArch64 LDR that targets
-    // an mprotected page. Handle only that known instruction and leave all
-    // other faults to Android/ART or the previous process handler.
+    // Handle only the exact LDR used by the protected-page smoke test. Any
+    // other SIGSEGV is deliberately chained to the previous Android handler.
     uint32_t instruction = 0;
     std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
     const bool is_known_test_fault = (instruction & 0xFFC003FFu) == 0xF9400000u;
@@ -77,9 +83,6 @@ void saintsrm_sigsegv_handler(int sig, siginfo_t* info, void* context) {
          reinterpret_cast<void*>(pc), instruction, is_known_test_fault ? 1 : 0);
 
     if (is_known_test_fault) {
-        // Restore x0 so the test has deterministic post-fault state, advance
-        // PC over the faulting 32-bit AArch64 instruction, and make the page
-        // readable again. The page was aligned using the runtime page size.
         uc->uc_mcontext.regs[0] = 0;
         uc->uc_mcontext.pc = pc + 4;
         g_protected_page_passed.store(true, std::memory_order_relaxed);
@@ -150,14 +153,10 @@ std::string run_protected_page_test() {
     }
 
 #if defined(__aarch64__)
-    // Deliberately fault one LDR. The SIGSEGV handler advances PC by exactly
-    // one AArch64 instruction, proving that a protected-page access can be
-    // intercepted and resumed without terminating the process.
+    g_protected_page_passed.store(false, std::memory_order_relaxed);
     register const void* address asm("x1") = page;
     asm volatile("ldr x0, [x1]" : : "r"(address) : "x0", "memory");
 #else
-    // The Android target is arm64-only. Keep a clear failure if this file is
-    // accidentally compiled for another architecture.
     munmap(page, static_cast<size_t>(page_size));
     return "FAIL: smoke test requires AArch64";
 #endif
@@ -168,6 +167,16 @@ std::string run_protected_page_test() {
 
     if (!passed || !restored) return "FAIL: protected-page SIGSEGV continuation";
     return "PASS: protected-page SIGSEGV continuation";
+}
+
+bool test_dynamic_loader() {
+    void* handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        LOGE("dlopen(libvulkan.so) failed: %s", dlerror());
+        return false;
+    }
+    dlclose(handle);
+    return true;
 }
 
 bool init_vulkan() {
@@ -232,6 +241,9 @@ Java_com_saintsrM_smoketest_MainActivity_nativeRunSmokeTests(JNIEnv* env, jclass
     } else {
         out << "protected-page test: SKIPPED\n";
     }
+
+    const bool loader = test_dynamic_loader();
+    out << "dynamic loader: " << (loader ? "PASS" : "FAIL") << "\n";
 
     const bool vulkan = init_vulkan();
     out << "Vulkan instance/devices: " << (vulkan ? "PASS" : "FAIL") << "\n";
