@@ -9,6 +9,10 @@ import android.widget.TextView;
 import android.widget.LinearLayout;
 import android.graphics.Color;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+
 public final class MainActivity extends Activity implements SurfaceHolder.Callback {
     static {
         System.loadLibrary("saintsrm_smoke");
@@ -42,7 +46,18 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         root.addView(surfaceView, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(root);
 
-        status.setText(nativeRunSmokeTests());
+        String result = nativeRunSmokeTests();
+        status.setText(result);
+        writeSmokeReport(result);
+    }
+
+    private void writeSmokeReport(String result) {
+        File report = new File(getFilesDir(), "saintsrm-smoke.txt");
+        try (FileOutputStream out = new FileOutputStream(report, false)) {
+            out.write(result.getBytes(StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+            // The on-screen result and logcat remain available if file output fails.
+        }
     }
 
     @Override public void surfaceCreated(SurfaceHolder holder) {
