@@ -13,17 +13,26 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: 'platform-tools'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: true
 
       - name: Install Android build dependencies
         run: |
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmake;3.31.6" "ndk;27.2.12479018"
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.31.6" \
+            "ndk;27.2.12479018"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -33,6 +42,28 @@ jobs:
       - name: Build debug APK
         working-directory: android
         run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify 16KB APK ZIP alignment
+        run: |
+          APK=$(find android/app/build/outputs/apk/debug -name '*.apk' -print -quit)
+          test -n "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -v -c -P 16 4 "$APK"
+
+      - name: Verify ELF LOAD alignment
+        run: |
+          set -euo pipefail
+          APK=$(find android/app/build/outputs/apk/debug -name '*.apk' -print -quit)
+          TMP=$(mktemp -d)
+          unzip -q "$APK" 'lib/arm64-v8a/*.so' -d "$TMP"
+          OBJDUMP="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+          for so in "$TMP"/lib/arm64-v8a/*.so; do
+            echo "== $so =="
+            "$OBJDUMP" -p "$so" | grep 'LOAD'
+            if "$OBJDUMP" -p "$so" | grep 'LOAD' | grep -v 'align 2\\*\\*14' >/dev/null; then
+              echo "ERROR: LOAD segment is not 16KB aligned: $so"
+              exit 1
+            fi
+          done
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
