@@ -1,13 +1,18 @@
 package com.saintsm.smoketest;
 
 import android.app.Activity;
+import android.content.Intent;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
-import android.widget.TextView;
+import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.graphics.Color;
+import android.graphics.Typeface;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -20,6 +25,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private SurfaceView surfaceView;
     private TextView status;
+    private String reportText = "";
 
     private static native void nativeSetSurface(Surface surface);
     private static native void nativeClearSurface();
@@ -34,21 +40,60 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.BLACK);
 
+        Button share = new Button(this);
+        share.setText("Поделиться отчётом");
+        share.setOnClickListener(v -> shareReport());
+        root.addView(share, new LinearLayout.LayoutParams(-1, -2));
+
+        ScrollView reportScroll = new ScrollView(this);
+        reportScroll.setFillViewport(true);
+
         status = new TextView(this);
         status.setTextColor(Color.WHITE);
         status.setTextSize(14);
+        status.setTypeface(Typeface.MONOSPACE);
         status.setPadding(24, 16, 24, 16);
+        status.setTextIsSelectable(true);
         status.setText("SaintsRM smoke-test: starting...");
-        root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+        reportScroll.addView(status, new ScrollView.LayoutParams(-1, -2));
+        root.addView(reportScroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
         surfaceView = new SurfaceView(this);
         surfaceView.getHolder().addCallback(this);
-        root.addView(surfaceView, new LinearLayout.LayoutParams(-1, 0, 1));
+        root.addView(surfaceView, new LinearLayout.LayoutParams(-1, 1));
         setContentView(root);
 
-        String result = nativeRunSmokeTests();
-        status.setText(result);
-        writeSmokeReport(result);
+        String nativeReport = nativeRunSmokeTests();
+        reportText = buildDeviceReport(nativeReport);
+        status.setText(reportText);
+        writeSmokeReport(reportText);
+    }
+
+    private String buildDeviceReport(String nativeReport) {
+        StringBuilder out = new StringBuilder();
+        out.append("Android model: ").append(Build.MODEL).append('\n');
+        out.append("Android manufacturer: ").append(Build.MANUFACTURER).append('\n');
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            out.append("SoC model: ").append(Build.SOC_MODEL).append('\n');
+        } else {
+            out.append("SoC model: unavailable (API < 31)\n");
+        }
+        out.append("Android release: ").append(Build.VERSION.RELEASE).append('\n');
+        out.append("Android SDK_INT: ").append(Build.VERSION.SDK_INT).append('\n');
+        out.append('\n');
+        out.append(nativeReport);
+        return out.toString();
+    }
+
+    private void shareReport() {
+        if (reportText.isEmpty()) {
+            reportText = status.getText().toString();
+        }
+        Intent intent = new Intent(Intent.ACTION_SEND);
+        intent.setType("text/plain");
+        intent.putExtra(Intent.EXTRA_SUBJECT, "SaintsRM smoke-test report");
+        intent.putExtra(Intent.EXTRA_TEXT, reportText);
+        startActivity(Intent.createChooser(intent, "Поделиться отчётом"));
     }
 
     private void writeSmokeReport(String result) {
