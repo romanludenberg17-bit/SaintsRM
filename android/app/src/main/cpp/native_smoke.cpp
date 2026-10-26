@@ -33,8 +33,6 @@ VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 struct sigaction g_previous_sigsegv{};
 std::atomic<bool> g_signal_installed{false};
 
-// Signal-handler state is fully preallocated. The handler never allocates,
-// formats text, logs, or calls into JNI/ART.
 std::atomic_flag g_fault_handler_busy = ATOMIC_FLAG_INIT;
 std::atomic<uintptr_t> g_last_fault_address{0};
 std::atomic<uintptr_t> g_last_fault_pc{0};
@@ -50,18 +48,27 @@ std::atomic<uint32_t> g_test_expected_instruction{0xF9400020u};
 std::atomic<bool> g_test_fault_seen{false};
 std::atomic<bool> g_test_mprotect_succeeded{false};
 
+using SigInfoHandler = void (*)(int, siginfo_t*, void*);
+
 bool is_default_handler(const struct sigaction& action) {
-    if ((action.sa_flags & SA_SIGINFO) != 0) return action.sa_sigaction == SIG_DFL;
+    if ((action.sa_flags & SA_SIGINFO) != 0) {
+        return action.sa_sigaction == reinterpret_cast<SigInfoHandler>(SIG_DFL);
+    }
     return action.sa_handler == SIG_DFL;
 }
 
 bool is_ignore_handler(const struct sigaction& action) {
-    if ((action.sa_flags & SA_SIGINFO) != 0) return action.sa_sigaction == SIG_IGN;
+    if ((action.sa_flags & SA_SIGINFO) != 0) {
+        return action.sa_sigaction == reinterpret_cast<SigInfoHandler>(SIG_IGN);
+    }
     return action.sa_handler == SIG_IGN;
 }
 
 void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
-    if (is_ignore_handler(g_previous_sigsegv)) return;
+    if (is_ignore_handler(g_previous_sigsegv)) {
+        sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
+        return;
+    }
 
     if (is_default_handler(g_previous_sigsegv)) {
         sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
