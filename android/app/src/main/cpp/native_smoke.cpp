@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 
+#define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
 
 #define LOG_TAG "SaintsRM-Smoke"
@@ -32,6 +33,9 @@ VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 struct sigaction g_previous_sigsegv{};
 std::atomic<bool> g_signal_installed{false};
 std::atomic<bool> g_protected_page_passed{false};
+std::atomic<uintptr_t> g_last_fault_address{0};
+std::atomic<uintptr_t> g_last_fault_pc{0};
+std::atomic<uint32_t> g_last_fault_instruction{0};
 
 bool is_default_handler(const struct sigaction& action) {
     if ((action.sa_flags & SA_SIGINFO) != 0) return action.sa_sigaction == SIG_DFL;
@@ -47,9 +51,6 @@ void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
     if (is_ignore_handler(g_previous_sigsegv)) return;
 
     if (is_default_handler(g_previous_sigsegv)) {
-        // Restore the original/default disposition. Returning from the handler
-        // causes the faulting instruction to be retried and the kernel will
-        // then apply the restored default action.
         sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
         return;
     }
@@ -73,15 +74,15 @@ void saintsrm_sigsegv_handler(int sig, siginfo_t* info, void* context) {
     const uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->si_addr);
 
-    // Handle only the exact LDR used by the protected-page smoke test. Any
-    // other SIGSEGV is deliberately chained to the previous Android handler.
     uint32_t instruction = 0;
     std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
+    g_last_fault_address.store(fault, std::memory_order_relaxed);
+    g_last_fault_pc.store(pc, std::memory_order_relaxed);
+    g_last_fault_instruction.store(instruction, std::memory_order_relaxed);
+
+    // Only the exact LDR used by the protected-page smoke test is handled.
+    // Everything else is chained to the previous Android/ART disposition.
     const bool is_known_test_fault = (instruction & 0xFFC003FFu) == 0xF9400000u;
-
-    LOGI("SIGSEGV fault=%p pc=%p insn=0x%08x known=%d", reinterpret_cast<void*>(fault),
-         reinterpret_cast<void*>(pc), instruction, is_known_test_fault ? 1 : 0);
-
     if (is_known_test_fault) {
         uc->uc_mcontext.regs[0] = 0;
         uc->uc_mcontext.pc = pc + 4;
@@ -228,7 +229,7 @@ Java_com_saintsrM_smoketest_MainActivity_nativeRunSmokeTests(JNIEnv* env, jclass
     std::ostringstream out;
     out << "SaintsRM smoke-test\n";
     out << "page size: " << page_size << " bytes\n";
-    out << "16 KiB compatible linker: enabled\n";
+    out << "16 KiB linker max-page-size: enabled\n";
 
     const bool alt_stack = install_alt_stack_for_current_thread();
     out << "alt signal stack: " << (alt_stack ? "PASS" : "FAIL") << "\n";
@@ -238,6 +239,9 @@ Java_com_saintsrM_smoketest_MainActivity_nativeRunSmokeTests(JNIEnv* env, jclass
 
     if (signals && alt_stack) {
         out << run_protected_page_test() << "\n";
+        out << "last fault addr: 0x" << std::hex << g_last_fault_address.load() << "\n";
+        out << "last fault pc: 0x" << std::hex << g_last_fault_pc.load() << "\n";
+        out << "last fault insn: 0x" << std::hex << g_last_fault_instruction.load() << std::dec << "\n";
     } else {
         out << "protected-page test: SKIPPED\n";
     }
