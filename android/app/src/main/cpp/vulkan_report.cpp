@@ -1,4 +1,5 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
+#include <jni.h>
 #include <vulkan/vulkan.h>
 
 #include <cstring>
@@ -71,68 +72,93 @@ void append_device_report(std::ostringstream& out, VkPhysicalDevice device) {
         out << "  <enumeration failed: " << result << ">\n";
     }
 
+    const uint32_t api_version = properties.apiVersion;
+    const bool has_vulkan11 =
+        VK_VERSION_MAJOR(api_version) > 1 ||
+        (VK_VERSION_MAJOR(api_version) == 1 && VK_VERSION_MINOR(api_version) >= 1);
     const bool has_vulkan12 =
-        VK_VERSION_MAJOR(properties.apiVersion) > 1 ||
-        (VK_VERSION_MAJOR(properties.apiVersion) == 1 &&
-         VK_VERSION_MINOR(properties.apiVersion) >= 2);
+        VK_VERSION_MAJOR(api_version) > 1 ||
+        (VK_VERSION_MAJOR(api_version) == 1 && VK_VERSION_MINOR(api_version) >= 2);
     const bool has_interlock =
         has_extension(extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
     const bool has_float_controls =
         has_vulkan12 || has_extension(extensions, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+    const bool has_properties2_extension =
+        has_extension(extensions, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    const bool can_query_features2 = has_vulkan11 || has_properties2_extension;
 
-    VkPhysicalDeviceVulkan12Features vulkan12{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
-    };
-    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT
-    };
+    out << "capabilityQuery.features2: "
+        << (can_query_features2 ? "available" : "unavailable") << "\n";
+    out << "capabilityQuery.fragmentShaderInterlockExtension: "
+        << (has_interlock ? "advertised" : "not advertised") << "\n";
+    out << "capabilityQuery.shaderFloatControls: "
+        << (has_float_controls ? "advertised/core" : "not advertised") << "\n";
 
-    VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    if (has_vulkan12) {
-        features2.pNext = &vulkan12;
-        if (has_interlock) {
-            vulkan12.pNext = &interlock;
+    VkPhysicalDeviceVulkan12Features vulkan12{};
+    vulkan12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{};
+    interlock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT;
+
+    if (can_query_features2) {
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+
+        VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&features2);
+        if (has_vulkan12) {
+            tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&vulkan12);
+            tail = reinterpret_cast<VkBaseOutStructure*>(&vulkan12);
         }
-    } else if (has_interlock) {
-        features2.pNext = &interlock;
-    }
-    vkGetPhysicalDeviceFeatures2(device, &features2);
+        if (has_interlock) {
+            tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&interlock);
+        }
 
-    if (has_vulkan12) {
-        out << "features.descriptorIndexing: "
-            << (vulkan12.descriptorIndexing ? "true" : "false") << "\n";
-        out << "features.shaderSampledImageArrayNonUniformIndexing: "
-            << (vulkan12.shaderSampledImageArrayNonUniformIndexing ? "true" : "false") << "\n";
-        out << "features.runtimeDescriptorArray: "
-            << (vulkan12.runtimeDescriptorArray ? "true" : "false") << "\n";
-        out << "features.bufferDeviceAddress: "
-            << (vulkan12.bufferDeviceAddress ? "true" : "false") << "\n";
-        out << "features.timelineSemaphore: "
-            << (vulkan12.timelineSemaphore ? "true" : "false") << "\n";
+        vkGetPhysicalDeviceFeatures2(device, &features2);
+
+        if (has_vulkan12) {
+            out << "features.descriptorIndexing: "
+                << (vulkan12.descriptorIndexing ? "true" : "false") << "\n";
+            out << "features.shaderSampledImageArrayNonUniformIndexing: "
+                << (vulkan12.shaderSampledImageArrayNonUniformIndexing ? "true" : "false") << "\n";
+            out << "features.runtimeDescriptorArray: "
+                << (vulkan12.runtimeDescriptorArray ? "true" : "false") << "\n";
+            out << "features.bufferDeviceAddress: "
+                << (vulkan12.bufferDeviceAddress ? "true" : "false") << "\n";
+            out << "features.timelineSemaphore: "
+                << (vulkan12.timelineSemaphore ? "true" : "false") << "\n";
+        } else {
+            out << "features.descriptorIndexing: unavailable (Vulkan < 1.2)\n";
+            out << "features.shaderSampledImageArrayNonUniformIndexing: unavailable (Vulkan < 1.2)\n";
+            out << "features.runtimeDescriptorArray: unavailable (Vulkan < 1.2)\n";
+            out << "features.bufferDeviceAddress: unavailable (Vulkan < 1.2)\n";
+            out << "features.timelineSemaphore: unavailable (Vulkan < 1.2)\n";
+        }
+
+        if (has_interlock) {
+            out << "features.fragmentShaderInterlock.pixel: "
+                << (interlock.fragmentShaderPixelInterlock ? "true" : "false") << "\n";
+            out << "features.fragmentShaderInterlock.sample: "
+                << (interlock.fragmentShaderSampleInterlock ? "true" : "false") << "\n";
+            out << "features.fragmentShaderInterlock.shadingRate: "
+                << (interlock.fragmentShaderShadingRateInterlock ? "true" : "false") << "\n";
+        } else {
+            out << "features.fragmentShaderInterlock: unsupported/not advertised\n";
+        }
     } else {
-        out << "features.descriptorIndexing: unavailable (Vulkan < 1.2)\n";
-        out << "features.shaderSampledImageArrayNonUniformIndexing: unavailable (Vulkan < 1.2)\n";
-        out << "features.runtimeDescriptorArray: unavailable (Vulkan < 1.2)\n";
-        out << "features.bufferDeviceAddress: unavailable (Vulkan < 1.2)\n";
-        out << "features.timelineSemaphore: unavailable (Vulkan < 1.2)\n";
+        out << "features.descriptorIndexing: unavailable (features2 query unsupported)\n";
+        out << "features.shaderSampledImageArrayNonUniformIndexing: unavailable (features2 query unsupported)\n";
+        out << "features.runtimeDescriptorArray: unavailable (features2 query unsupported)\n";
+        out << "features.bufferDeviceAddress: unavailable (features2 query unsupported)\n";
+        out << "features.timelineSemaphore: unavailable (features2 query unsupported)\n";
+        out << "features.fragmentShaderInterlock: unavailable (features2 query unsupported)\n";
     }
 
-    if (has_interlock) {
-        out << "features.fragmentShaderInterlock.pixel: "
-            << (interlock.fragmentShaderPixelInterlock ? "true" : "false") << "\n";
-        out << "features.fragmentShaderInterlock.sample: "
-            << (interlock.fragmentShaderSampleInterlock ? "true" : "false") << "\n";
-        out << "features.fragmentShaderInterlock.shadingRate: "
-            << (interlock.fragmentShaderShadingRateInterlock ? "true" : "false") << "\n";
-    } else {
-        out << "features.fragmentShaderInterlock: unsupported/not advertised\n";
-    }
+    if (has_float_controls && can_query_features2) {
+        VkPhysicalDeviceFloatControlsProperties float_controls{};
+        float_controls.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
 
-    if (has_float_controls) {
-        VkPhysicalDeviceFloatControlsProperties float_controls{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES
-        };
-        VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        VkPhysicalDeviceProperties2 properties2{};
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
         properties2.pNext = &float_controls;
         vkGetPhysicalDeviceProperties2(device, &properties2);
 
@@ -141,7 +167,7 @@ void append_device_report(std::ostringstream& out, VkPhysicalDevice device) {
         out << "floatControls.shaderRoundingModeRTEFloat32: "
             << (float_controls.shaderRoundingModeRTEFloat32 ? "true" : "false") << "\n";
     } else {
-        out << "floatControls: unsupported/not advertised\n";
+        out << "floatControls: unavailable for property query\n";
     }
 }
 
