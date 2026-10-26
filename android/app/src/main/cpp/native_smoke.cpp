@@ -5,13 +5,13 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -21,7 +21,6 @@
 
 #define LOG_TAG "SaintsRM-Smoke"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
@@ -32,10 +31,24 @@ VkInstance g_instance = VK_NULL_HANDLE;
 VkSurfaceKHR g_surface = VK_NULL_HANDLE;
 struct sigaction g_previous_sigsegv{};
 std::atomic<bool> g_signal_installed{false};
-std::atomic<bool> g_protected_page_passed{false};
+
+// Signal-handler state is fully preallocated. The handler never allocates,
+// formats text, logs, or calls into JNI/ART.
+std::atomic_flag g_fault_handler_busy = ATOMIC_FLAG_INIT;
 std::atomic<uintptr_t> g_last_fault_address{0};
 std::atomic<uintptr_t> g_last_fault_pc{0};
 std::atomic<uint32_t> g_last_fault_instruction{0};
+std::atomic<uint32_t> g_fault_reentry_count{0};
+std::atomic<uint32_t> g_fault_contention_count{0};
+
+// Active protected-page test state. Only the test thread mutates this state.
+enum class FaultMode : uint32_t { kNone = 0, kDumpAndSkip = 1, kDemandCommit = 2 };
+std::atomic<uint32_t> g_fault_mode{0};
+std::atomic<uintptr_t> g_test_page{0};
+std::atomic<size_t> g_test_page_size{0};
+std::atomic<uint32_t> g_test_expected_instruction{0xF9400020u}; // ldr x0, [x1]
+std::atomic<bool> g_test_fault_seen{false};
+std::atomic<bool> g_test_mprotect_succeeded{false};
 
 bool is_default_handler(const struct sigaction& action) {
     if ((action.sa_flags & SA_SIGINFO) != 0) return action.sa_sigaction == SIG_DFL;
@@ -51,6 +64,8 @@ void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
     if (is_ignore_handler(g_previous_sigsegv)) return;
 
     if (is_default_handler(g_previous_sigsegv)) {
+        // Restore the original default disposition. Returning from this handler
+        // makes the kernel retry the faulting instruction with SIG_DFL.
         sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
         return;
     }
@@ -70,26 +85,58 @@ void chain_previous_sigsegv(int sig, siginfo_t* info, void* context) {
 
 #if defined(__aarch64__)
 void saintsrm_sigsegv_handler(int sig, siginfo_t* info, void* context) {
+    if (g_fault_handler_busy.test_and_set(std::memory_order_acquire)) {
+        g_fault_reentry_count.fetch_add(1, std::memory_order_relaxed);
+        chain_previous_sigsegv(sig, info, context);
+        return;
+    }
+
     auto* uc = reinterpret_cast<ucontext_t*>(context);
     const uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
     const uintptr_t fault = reinterpret_cast<uintptr_t>(info->si_addr);
 
-    uint32_t instruction = 0;
-    std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
     g_last_fault_address.store(fault, std::memory_order_relaxed);
     g_last_fault_pc.store(pc, std::memory_order_relaxed);
-    g_last_fault_instruction.store(instruction, std::memory_order_relaxed);
+    // Do not dereference the faulting PC from the handler: that read can fault
+    // recursively. For this deterministic smoke test the expected instruction
+    // is known before execution and is stored in preallocated state.
+    const uint32_t expected = g_test_expected_instruction.load(std::memory_order_relaxed);
+    g_last_fault_instruction.store(expected, std::memory_order_relaxed);
 
-    // Only the exact LDR used by the protected-page smoke test is handled.
-    // Everything else is chained to the previous Android/ART disposition.
-    const bool is_known_test_fault = (instruction & 0xFFC003FFu) == 0xF9400000u;
-    if (is_known_test_fault) {
-        uc->uc_mcontext.regs[0] = 0;
-        uc->uc_mcontext.pc = pc + 4;
-        g_protected_page_passed.store(true, std::memory_order_relaxed);
-        return;
+    const uintptr_t page = g_test_page.load(std::memory_order_relaxed);
+    const size_t page_size = g_test_page_size.load(std::memory_order_relaxed);
+    const uint32_t mode = g_fault_mode.load(std::memory_order_relaxed);
+    const bool is_test_page = page != 0 && page_size != 0 &&
+        fault >= page && fault < page + page_size;
+    const bool is_test_instruction = mode != 0;
+
+    if (is_test_page && is_test_instruction) {
+        g_test_fault_seen.store(true, std::memory_order_relaxed);
+
+        if (mode == static_cast<uint32_t>(FaultMode::kDemandCommit)) {
+            // Re-enable the page and return WITHOUT advancing PC. The CPU will
+            // retry the original LDR and the C++ code verifies the loaded value.
+            const long result = syscall(SYS_mprotect,
+                                        reinterpret_cast<void*>(page),
+                                        page_size,
+                                        PROT_READ | PROT_WRITE);
+            g_test_mprotect_succeeded.store(result == 0, std::memory_order_relaxed);
+            if (result == 0) {
+                g_fault_handler_busy.clear(std::memory_order_release);
+                return;
+            }
+        } else if (mode == static_cast<uint32_t>(FaultMode::kDumpAndSkip)) {
+            // Diagnostic-only mode: suppress the load result and skip exactly
+            // one 32-bit AArch64 instruction.
+            uc->uc_mcontext.regs[0] = 0;
+            uc->uc_mcontext.pc = pc + 4;
+            g_fault_handler_busy.clear(std::memory_order_release);
+            return;
+        }
     }
 
+    g_fault_contention_count.fetch_add(1, std::memory_order_relaxed);
+    g_fault_handler_busy.clear(std::memory_order_release);
     chain_previous_sigsegv(sig, info, context);
 }
 #else
@@ -139,36 +186,56 @@ bool install_alt_stack_for_current_thread() {
     return true;
 }
 
-std::string run_protected_page_test() {
+struct TestResult {
+    bool fault_seen;
+    bool mprotect_succeeded;
+    uint64_t read_value;
+    uintptr_t fault_pc;
+};
+
+#if defined(__aarch64__)
+TestResult run_protected_page_test(FaultMode mode, uint64_t initial_value) {
+    TestResult result{false, false, 0, 0};
     const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) return "FAIL: sysconf(_SC_PAGESIZE)";
+    if (page_size <= 0) return result;
 
     void* page = mmap(nullptr, static_cast<size_t>(page_size), PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED) return "FAIL: mmap protected-page test";
+    if (page == MAP_FAILED) return result;
 
-    std::memset(page, 0xA5, static_cast<size_t>(page_size));
+    *reinterpret_cast<volatile uint64_t*>(page) = initial_value;
     if (mprotect(page, static_cast<size_t>(page_size), PROT_NONE) != 0) {
         munmap(page, static_cast<size_t>(page_size));
-        return "FAIL: mprotect(PROT_NONE)";
+        return result;
     }
 
-#if defined(__aarch64__)
-    g_protected_page_passed.store(false, std::memory_order_relaxed);
+    g_test_page.store(reinterpret_cast<uintptr_t>(page), std::memory_order_relaxed);
+    g_test_page_size.store(static_cast<size_t>(page_size), std::memory_order_relaxed);
+    g_fault_mode.store(static_cast<uint32_t>(mode), std::memory_order_release);
+    g_test_fault_seen.store(false, std::memory_order_relaxed);
+    g_test_mprotect_succeeded.store(false, std::memory_order_relaxed);
+
     register const void* address asm("x1") = page;
-    asm volatile("ldr x0, [x1]" : : "r"(address) : "x0", "memory");
-#else
-    munmap(page, static_cast<size_t>(page_size));
-    return "FAIL: smoke test requires AArch64";
-#endif
+    register uint64_t value asm("x0");
+    asm volatile("ldr x0, [x1]" : "=r"(value) : "r"(address) : "memory");
+    result.read_value = value;
 
-    const bool passed = g_protected_page_passed.load(std::memory_order_relaxed);
-    const bool restored = mprotect(page, static_cast<size_t>(page_size), PROT_READ | PROT_WRITE) == 0;
-    munmap(page, static_cast<size_t>(page_size));
+    result.fault_seen = g_test_fault_seen.load(std::memory_order_relaxed);
+    result.mprotect_succeeded = g_test_mprotect_succeeded.load(std::memory_order_relaxed);
+    result.fault_pc = g_last_fault_pc.load(std::memory_order_relaxed);
 
-    if (!passed || !restored) return "FAIL: protected-page SIGSEGV continuation";
-    return "PASS: protected-page SIGSEGV continuation";
+    g_fault_mode.store(0, std::memory_order_release);
+    g_test_page.store(0, std::memory_order_relaxed);
+    g_test_page_size.store(0, std::memory_order_relaxed);
+    g_fault_handler_busy.clear(std::memory_order_release);
+
+    mprotect(page, static_cast<size_t>(page_size), PROT_READ | PROT_WRITE);
+    munmap(page, static_cast<size_t>(page_size));
+    return result;
 }
+#else
+TestResult run_protected_page_test(FaultMode, uint64_t) { return {false, false, 0, 0}; }
+#endif
 
 bool test_dynamic_loader() {
     void* handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -222,32 +289,43 @@ void destroy_surface() {
 }  // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_saintsrM_smoketest_MainActivity_nativeRunSmokeTests(JNIEnv* env, jclass) {
+Java_com_saintsm_smoketest_MainActivity_nativeRunSmokeTests(JNIEnv* env, jclass) {
     const long page_size = sysconf(_SC_PAGESIZE);
     LOGI("runtime page size: %ld", page_size);
 
     std::ostringstream out;
     out << "SaintsRM smoke-test\n";
     out << "page size: " << page_size << " bytes\n";
-    out << "16 KiB linker max-page-size: enabled\n";
+    out << "ELF 16 KiB linker flags: enabled\n";
+    out << "ABI: arm64-v8a\n";
 
     const bool alt_stack = install_alt_stack_for_current_thread();
-    out << "alt signal stack: " << (alt_stack ? "PASS" : "FAIL") << "\n";
+    out << "alt signal stack (current thread): " << (alt_stack ? "PASS" : "FAIL") << "\n";
 
     const bool signals = install_signal_handler();
     out << "SIGSEGV handler: " << (signals ? "PASS" : "FAIL") << "\n";
 
     if (signals && alt_stack) {
-        out << run_protected_page_test() << "\n";
-        out << "last fault addr: 0x" << std::hex << g_last_fault_address.load() << "\n";
-        out << "last fault pc: 0x" << std::hex << g_last_fault_pc.load() << "\n";
-        out << "last fault insn: 0x" << std::hex << g_last_fault_instruction.load() << std::dec << "\n";
+        const TestResult dump = run_protected_page_test(FaultMode::kDumpAndSkip, 0x1122334455667788ULL);
+        out << "protected-page dump/skip: "
+            << (dump.fault_seen && dump.read_value == 0 ? "PASS" : "FAIL") << "\n";
+        out << "  read value: 0x" << std::hex << dump.read_value << std::dec << "\n";
+        out << "  fault pc: 0x" << std::hex << dump.fault_pc << std::dec << "\n";
+
+        const TestResult demand = run_protected_page_test(FaultMode::kDemandCommit, 0x1122334455667788ULL);
+        out << "protected-page demand-commit/retry: "
+            << (demand.fault_seen && demand.mprotect_succeeded &&
+                demand.read_value == 0x1122334455667788ULL ? "PASS" : "FAIL") << "\n";
+        out << "  read value: 0x" << std::hex << demand.read_value << std::dec << "\n";
+        out << "  fault pc: 0x" << std::hex << demand.fault_pc << std::dec << "\n";
+        out << "fault-handler reentry: " << g_fault_reentry_count.load() << "\n";
+        out << "fault-handler contention: " << g_fault_contention_count.load() << "\n";
     } else {
-        out << "protected-page test: SKIPPED\n";
+        out << "protected-page tests: SKIPPED\n";
     }
 
     const bool loader = test_dynamic_loader();
-    out << "dynamic loader: " << (loader ? "PASS" : "FAIL") << "\n";
+    out << "dynamic loader (libvulkan.so): " << (loader ? "PASS" : "FAIL") << "\n";
 
     const bool vulkan = init_vulkan();
     out << "Vulkan instance/devices: " << (vulkan ? "PASS" : "FAIL") << "\n";
@@ -257,7 +335,7 @@ Java_com_saintsrM_smoketest_MainActivity_nativeRunSmokeTests(JNIEnv* env, jclass
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_saintsrM_smoketest_MainActivity_nativeSetSurface(JNIEnv* env, jclass, jobject surface) {
+Java_com_saintsm_smoketest_MainActivity_nativeSetSurface(JNIEnv* env, jclass, jobject surface) {
     std::lock_guard lock(g_surface_mutex);
     if (g_instance == VK_NULL_HANDLE || surface == nullptr) return;
 
@@ -283,13 +361,13 @@ Java_com_saintsrM_smoketest_MainActivity_nativeSetSurface(JNIEnv* env, jclass, j
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_saintsrM_smoketest_MainActivity_nativeClearSurface(JNIEnv*, jclass) {
+Java_com_saintsm_smoketest_MainActivity_nativeClearSurface(JNIEnv*, jclass) {
     destroy_surface();
     LOGI("Vulkan Android surface cleared");
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_saintsrM_smoketest_MainActivity_nativeOnTrimMemory(JNIEnv*, jclass, jint level) {
+Java_com_saintsm_smoketest_MainActivity_nativeOnTrimMemory(JNIEnv*, jclass, jint level) {
     LOGI("onTrimMemory level=%d; stopping presentation resources", level);
     destroy_surface();
 }
