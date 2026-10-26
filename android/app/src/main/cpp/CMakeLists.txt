@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.22)
 project(saintsrm_smoke LANGUAGES CXX)
 
+if(NOT ANDROID)
+    message(FATAL_ERROR "SaintsRM Android smoke target requires the Android NDK")
+endif()
+
+if(NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+    message(FATAL_ERROR "SaintsRM smoke target supports arm64-v8a only; got ${CMAKE_ANDROID_ARCH_ABI}")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
